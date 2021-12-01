@@ -5,13 +5,13 @@
  */
 
 const {parse: parseContentType} = require("content-type");
-const {Forbidden, InternalServerError, NotFound, Unauthorized} = require("http-errors");
+const {Forbidden, InternalServerError, NotFound, Unauthorized, UnsupportedMediaType} = require("http-errors");
 const negotiateMediaType = require("negotiator/lib/mediaType");
 const stream = require("stream");
 const {promisify} = require("util");
 const zlib = require("zlib");
 
-const {contentTypesProvided} = require("../negotiate");
+const {contentTypesProvided, contentTypesConsumed} = require("../negotiate");
 const {fetch, Request} = require("../fetch");
 const sources = require("../sources");
 const utils = require("../utils");
@@ -135,6 +135,9 @@ const ifDatasetExists = async (req, res, next) => {
 };
 
 
+/* GET
+ */
+
 /* XXX TODO: Support automatically translating v1 (meta and tree) to v2
  * (main) if the latter is requested but only the former is available?
  * We could, but maybe not worth it for these new endpoints, unless/until we
@@ -162,6 +165,34 @@ const getDataset = contentTypesProvided([
   ["application/vnd.nextstrain.dataset.main+json", getDatasetMain],
   ["application/vnd.nextstrain.dataset.root-sequence+json", getDatasetRootSequence],
   ["application/vnd.nextstrain.dataset.tip-frequencies+json", getDatasetTipFrequencies],
+
+  /* XXX TODO: Support v1 (meta and tree) too?  We could, but maybe ok to say
+   * "just v2" for these new endpoints.
+   *   -trs, 22 Nov 2021
+   */
+]);
+
+
+/* PUT
+ */
+const receiveDatasetSubresource = type =>
+  receiveSubresource(req => req.context.dataset.subresource(type));
+
+
+const putDatasetSubresource = type => contentTypesConsumed([
+  [`application/vnd.nextstrain.dataset.${type}+json`, receiveDatasetSubresource(type)],
+]);
+
+
+const putDatasetMain           = putDatasetSubresource("main");
+const putDatasetRootSequence   = putDatasetSubresource("root-sequence");
+const putDatasetTipFrequencies = putDatasetSubresource("tip-frequencies");
+
+
+const putDataset = contentTypesConsumed([
+  ["application/vnd.nextstrain.dataset.main+json", putDatasetMain],
+  ["application/vnd.nextstrain.dataset.root-sequence+json", putDatasetRootSequence],
+  ["application/vnd.nextstrain.dataset.tip-frequencies+json", putDatasetTipFrequencies],
 
   /* XXX TODO: Support v1 (meta and tree) too?  We could, but maybe ok to say
    * "just v2" for these new endpoints.
@@ -198,6 +229,8 @@ const ifNarrativeExists = async (req, res, next) => {
 };
 
 
+/* GET
+ */
 const sendNarrativeSubresource = type =>
   sendSubresource(req => req.context.narrative.subresource(type));
 
@@ -212,6 +245,22 @@ const getNarrative = contentTypesProvided([
   ["text/html", ifNarrativeExists, sendAuspiceEntrypoint],
   ["text/markdown", getNarrativeMarkdown],
   ["text/vnd.nextstrain.narrative+markdown", getNarrativeMarkdown],
+]);
+
+
+/* PUT
+ */
+const receiveNarrativeSubresource = type =>
+  receiveSubresource(req => req.context.narrative.subresource(type));
+
+
+const putNarrativeMarkdown = contentTypesConsumed([
+  ["text/vnd.nextstrain.narrative+markdown", receiveNarrativeSubresource("md")],
+]);
+
+
+const putNarrative = contentTypesConsumed([
+  ["text/vnd.nextstrain.narrative+markdown", putNarrativeMarkdown],
 ]);
 
 
@@ -280,6 +329,73 @@ function sendSubresource(subresourceExtractor) {
        */
       compress: false,
     }));
+  };
+}
+
+
+/**
+ * Generate an Express endpoint that receives a dataset or narrative
+ * Subresource determined by the request.
+ *
+ * @param {subresourceExtractor} subresourceExtractor - Function to provide the Subresource instance from the request
+ * @returns {expressEndpointAsync}
+ */
+function receiveSubresource(subresourceExtractor) {
+  return async (req, res) => {
+    const method = "PUT";
+    const subresource = subresourceExtractor(req);
+    const subresourceUrl = await subresource.url(method);
+
+    /* Proxy the data through us:
+     *
+     *    client (browser, CLI, etc) ⟷ us (nextstrain.org) ⟷ upstream source
+     *
+     * Compress on the fly to gzip if it's not already gzip compressed.
+     */
+    // eslint-disable-next-line prefer-const
+    let headers = {
+      "Content-Type": subresource.mediaType,
+      ...copyHeaders(req, ["Content-Encoding"]),
+
+      /* XXX TODO: Consider setting Cache-Control rather than relying on
+       * ambiguous defaults.  Potentially impacts:
+       *
+       *   - Our own fetch() caching, including in sendSubresource() above
+       *   - Our Charon endpoints, if upstream headers are sent to the browser?
+       *   - CloudFront caching (not sure about its default behaviour)
+       *   - Browsers, if fetched directly, such as by redirection
+       *
+       * I think a cautious initial value would be to set "private" or "public"
+       * depending on the Source and then always set "must-revalidate,
+       * proxy-revalidate, max-age=0".  This would allow caches (ours,
+       * browsers, CloudFront?) to store the data but always check upstream
+       * with conditional requests.
+       *   -trs, 7 Dec 2021
+       */
+    };
+
+    let body = req.body;
+
+    // XXX FIXME test this out
+    if (!headers["Content-Encoding"]) {
+      headers["Content-Encoding"] = "gzip";
+      body = body.pipe(zlib.createGzip());
+    } else if (headers["Content-Encoding"] !== "gzip") {
+      throw new UnsupportedMediaType("unsupported Content-Encoding; only gzip is supported");
+    }
+
+    const upstreamRes = await fetch(subresourceUrl, {method, body, headers});
+
+    switch (upstreamRes.status) {
+      case 200:
+      case 204:
+        break;
+
+      default:
+        throw new InternalServerError(upstreamRes);
+    }
+
+    return res.status(204).end();
   };
 }
 
@@ -499,8 +615,10 @@ module.exports = {
   canonicalizeDataset,
   ifDatasetExists,
   getDataset,
+  putDataset,
 
   setNarrative,
   ifNarrativeExists,
   getNarrative,
+  putNarrative,
 };

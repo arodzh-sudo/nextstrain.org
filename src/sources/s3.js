@@ -140,7 +140,15 @@ class PrivateS3Source extends S3Source {
     throw new Error("visibleToUser() must be implemented explicitly by subclasses (not inherited from PrivateS3Source)");
   }
   async urlFor(path, method = 'GET') {
-    return S3.getSignedUrl(method === "HEAD" ? "headObject" : "getObject", {
+    const action = {
+      GET: "getObject",
+      HEAD: "headObject",
+      PUT: "putObject",
+    };
+
+    if (!action[method]) throw new Error(`Unsupported method: ${method}`);
+
+    return S3.getSignedUrl(action[method], {
       Bucket: this.bucket,
       Key: path
     });
