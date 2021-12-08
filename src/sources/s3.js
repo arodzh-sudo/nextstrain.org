@@ -144,6 +144,7 @@ class PrivateS3Source extends S3Source {
       GET: "getObject",
       HEAD: "headObject",
       PUT: "putObject",
+      DELETE: "deleteObject",
     };
 
     if (!action[method]) throw new Error(`Unsupported method: ${method}`);
